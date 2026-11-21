@@ -166,46 +166,45 @@ bool QueryEcho(HidDev& d, BYTE cmd, std::vector<BYTE>& r, size_t minLen) {
 // A mouse that is off or asleep (00, 00 00, or the receiver's 40 FF) is left out of the results, so
 // the tray keeps its last level, dimmed, for graceSec, as with the other receivers.
 struct AeroxModel {
-    USHORT pid;
-    USHORT receiverPid;  // stable identity on both the receiver and the cable
+    USHORT receiver;  // 2.4 GHz receiver PID (also the shared device key)
+    USHORT cable;     // USB cable PID
     const wchar_t* name;
-    bool wired;
-    bool percent;  // Gen 2 layout
+    bool percent;     // Gen 2 layout
 };
 
 const AeroxModel kAerox[] = {
-    { 0x1838, 0x1838, L"SteelSeries Aerox 3 Wireless", false, false },
-    { 0x183A, 0x1838, L"SteelSeries Aerox 3 Wireless", true, false },
-    { 0x1878, 0x1878, L"SteelSeries Aerox 3 Wireless CS2 Dragon Lore Edition", false, false },
-    { 0x187A, 0x1878, L"SteelSeries Aerox 3 Wireless CS2 Dragon Lore Edition", true, false },
-    { 0x1890, 0x1890, L"SteelSeries Aerox 3 Wireless Gen 2", false, true },
-    { 0x1892, 0x1890, L"SteelSeries Aerox 3 Wireless Gen 2", true, true },
-    { 0x1852, 0x1852, L"SteelSeries Aerox 5 Wireless", false, false },
-    { 0x1854, 0x1852, L"SteelSeries Aerox 5 Wireless", true, false },
-    { 0x1858, 0x1858, L"SteelSeries Aerox 9 Wireless", false, false },
-    { 0x185A, 0x1858, L"SteelSeries Aerox 9 Wireless", true, false },
-    { 0x1840, 0x1840, L"SteelSeries Prime Wireless", false, false },
-    { 0x1842, 0x1840, L"SteelSeries Prime Wireless", true, false },
-    { 0x1860, 0x1860, L"SteelSeries Aerox 5 Wireless Diablo IV Edition", false, false },  // untested hardware
+    { 0x1838, 0x183A, L"SteelSeries Aerox 3 Wireless", false },
+    { 0x1878, 0x187A, L"SteelSeries Aerox 3 Wireless CS2 Dragon Lore Edition", false },
+    { 0x1890, 0x1892, L"SteelSeries Aerox 3 Wireless Gen 2", true },
+    { 0x1852, 0x1854, L"SteelSeries Aerox 5 Wireless", false },
+    { 0x1860, 0x1862, L"SteelSeries Aerox 5 Wireless Diablo IV Edition", false },  // untested hardware
+    { 0x1858, 0x185A, L"SteelSeries Aerox 9 Wireless", false },
+    { 0x1840, 0x1842, L"SteelSeries Prime Wireless", false },
 };
 
 std::vector<USHORT> AeroxPids() {
     std::vector<USHORT> pids;
-    for (const auto& m : kAerox) pids.push_back(m.pid);
+    for (const auto& m : kAerox) {
+        pids.push_back(m.receiver);
+        pids.push_back(m.cable);
+    }
     return pids;
 }
 
 bool Aerox(HidDev& d, USHORT pid, DeviceStatus& s) {
-    auto m = std::find_if(std::begin(kAerox), std::end(kAerox), [&](const AeroxModel& a) { return a.pid == pid; });
+    auto m = std::find_if(std::begin(kAerox), std::end(kAerox),
+                          [&](const AeroxModel& a) { return a.receiver == pid || a.cable == pid; });
     if (m == std::end(kAerox)) return false;
-    const BYTE cmd = m->wired ? 0x92 : 0xD2;
+    const bool wired = pid == m->cable;
+    const BYTE cmd = wired ? 0x92 : 0xD2;
     std::vector<BYTE> r;
     if (!QueryEcho(d, cmd, r, m->percent ? 3 : 2)) return false;
     if (m->percent && r[1] > 0x02) return false;  // not a Gen 2 status byte
-    bool off = m->percent ? (!m->wired && r[1] == 0x00 && r[2] == 0x00) : (r[1] & 0x7F) == 0;
+    bool off = m->percent ? (!wired && r[1] == 0x00 && r[2] == 0x00) : (r[1] & 0x7F) == 0;
     if (off) return false;  // left out: the tray keeps the last level for graceSec
-    s = Mouse(pid, m->name, m->wired);
-    s.key = L"steelseries:" + Hex4(m->receiverPid);
+    // Share the receiver's key across receiver and cable so plugging or unplugging the cable
+    // updates the existing entry in place instead of leaving a dimmed duplicate for graceSec.
+    s = Mouse(m->receiver, m->name, wired);
     s.graceSec = 1800;
     if (m->percent) {
         s.charging = r[1] != 0x00;
@@ -287,11 +286,19 @@ void PollSteelSeries(PollContext& ctx) {
                 HidDev d;
                 DeviceStatus s;
                 if (!d.Open(*c) || !m.poll(d, pid, s)) continue;
-                // Aerox/Prime and Rival 650 can answer on both products; keep one entry, preferring the cable.
+                // Aerox/Prime and Rival 650 can answer on both products; keep one entry, preferring the cable
+                // (retaining a receiver percentage if the cable has not measured yet).
                 auto dup = std::find_if(ctx.out.begin(), ctx.out.end(), [&](const DeviceStatus& o) { return o.key == s.key; });
                 if (dup == ctx.out.end()) ctx.Add(s, vid, pid);
                 else {
-                    if (s.via == L"USB cable") { *dup = s; dup->vid = vid; }
+                    if (s.via == L"USB cable") {
+                        int prev = dup->percent;
+                        *dup = s;
+                        dup->vid = vid;
+                        if (dup->percent < 0) dup->percent = prev;
+                    } else if (dup->percent < 0 && s.percent >= 0) {
+                        dup->percent = s.percent;
+                    }
                     ctx.Claim(vid, pid);
                 }
                 break;

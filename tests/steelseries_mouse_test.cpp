@@ -97,7 +97,8 @@ bool HidDev::Write(const std::vector<BYTE>& data, int) {
     if (!repliesByPid.empty()) {
         auto it = repliesByPid.find(c_.pid);
         CHECK(it != repliesByPid.end());
-        CHECK(data == std::vector<BYTE>({ 0x00, it->second[0] }));
+        BYTE expected = it->second[0] == 0x40 ? 0xD2 : it->second[0];
+        CHECK(data == std::vector<BYTE>({ 0x00, expected }));
         queued.push_back(it->second);
         return true;
     }
@@ -135,11 +136,12 @@ int main() {
         { 0x187A, true, L"SteelSeries Aerox 3 Wireless CS2 Dragon Lore Edition", L"steelseries:1878" },
         { 0x1852, false, L"SteelSeries Aerox 5 Wireless", L"steelseries:1852" },
         { 0x1854, true, L"SteelSeries Aerox 5 Wireless", L"steelseries:1852" },
+        { 0x1860, false, L"SteelSeries Aerox 5 Wireless Diablo IV Edition", L"steelseries:1860" },
+        { 0x1862, true, L"SteelSeries Aerox 5 Wireless Diablo IV Edition", L"steelseries:1860" },
         { 0x1858, false, L"SteelSeries Aerox 9 Wireless", L"steelseries:1858" },
         { 0x185A, true, L"SteelSeries Aerox 9 Wireless", L"steelseries:1858" },
         { 0x1840, false, L"SteelSeries Prime Wireless", L"steelseries:1840" },
         { 0x1842, true, L"SteelSeries Prime Wireless", L"steelseries:1840" },
-        { 0x1860, false, L"SteelSeries Aerox 5 Wireless Diablo IV Edition", L"steelseries:1860" },
     };
     const Sample stepSamples[] = {
         { { 0x01 }, 0, false, true }, { { 0x13 }, 90, false, true }, { { 0x15 }, 100, false, true },
@@ -181,6 +183,27 @@ int main() {
     }
 
     ExpectOneMouse(gen2[0], gen2[1], { 0xD2, 0x00, 0x2D }, { 0x92, 0x01, 0x5F });
+    // Dragon Lore receiver answering 40 FF while charging on the cable: single cable entry under steelseries:1878.
+    {
+        repliesByPid = { { 0x1878, { 0x40, 0xFF } }, { 0x187A, { 0x92, 0x8B, 0x00 } } };
+        PollContext ctx;
+        ctx.colls = { Collection(0x1878), Collection(0x187A) };
+        PollSteelSeries(ctx);
+        CHECK(ctx.out.size() == 1 && ctx.IsClaimed(0x1038, 0x187A));
+        const auto& s = ctx.out.front();
+        CHECK(s.key == L"steelseries:1878" && s.via == L"USB cable" && s.percent == 50 && s.charging && s.vid == 0x1038);
+    }
+    // Gen 2 cable answering 01 FF (not measured yet) right after plugging in keeps the receiver's percentage.
+    {
+        repliesByPid = { { 0x1890, { 0xD2, 0x00, 0x56, 0x00 } }, { 0x1892, { 0x92, 0x01, 0xFF, 0x00 } } };
+        PollContext ctx;
+        ctx.colls = { Collection(0x1890), Collection(0x1892) };
+        PollSteelSeries(ctx);
+        CHECK(ctx.out.size() == 1 && ctx.IsClaimed(0x1038, 0x1890) && ctx.IsClaimed(0x1038, 0x1892));
+        const auto& s = ctx.out.front();
+        CHECK(s.key == L"steelseries:1890" && s.via == L"USB cable" && s.percent == 86 && s.charging && s.vid == 0x1038);
+    }
+    repliesByPid.clear();
 
     // Reports that do not echo the command are skipped (an acknowledgement, then the reply).
     noise = { 0x11, 0x00 };
@@ -210,6 +233,6 @@ int main() {
     CHECK(writes == 0);
     writeOk = true;
     ExpectNothing(0x1838, 0xD2, {});  // receiver never answers
-    std::puts("SteelSeries mouse tests passed (step and Gen 2 layouts, 13 models, USB/wireless, battery bounds, "
+    std::puts("SteelSeries mouse tests passed (step and Gen 2 layouts, 14 models, USB/wireless, battery bounds, "
               "charging, shared cable/receiver identity, off/asleep left out, echo filtering, resend, receiver NACK, I/O failures).");
 }
